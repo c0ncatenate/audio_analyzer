@@ -13,6 +13,7 @@ import datetime
 from pydub import AudioSegment
 import pygame
 import io
+import concurrent.futures
 
 class AudioPopDetector:
     def __init__(self, root):
@@ -42,7 +43,7 @@ class AudioPopDetector:
         self.play_button.grid(row=0, column=1, padx=10)
 
         # Detect Button
-        self.detect_button = tk.Button(self.controls_frame, text="Detect Pop Sound", command=self.detect_pop_sound)
+        self.detect_button = tk.Button(self.controls_frame, text="Detect Pop Sound", command=self.detect_pop_sound_parallel)
         self.detect_button.grid(row=0, column=2, padx=10)
 
         # Threshold Scale
@@ -91,8 +92,8 @@ class AudioPopDetector:
         # Load audio file using a file dialog
         self.file_path = filedialog.askopenfilename(filetypes=[("Audio Files", "*.wav *.mp3 *.m4a *.flac")])
         if self.file_path:
-            # Load the audio file using librosa for waveform analysis
-            self.y, self.sr = librosa.load(self.file_path, sr=None)
+            # Load and downsample the audio file using librosa
+            self.y, self.sr = librosa.load(self.file_path, sr=11025, mmap=True)  # Memory map and downsample to 11.025 kHz
             self.audio_segment = AudioSegment.from_file(self.file_path)
 
             # Extract metadata using mutagen
@@ -167,80 +168,99 @@ class AudioPopDetector:
         return dt.strftime('%Y-%m-%d %H:%M:%S')
 
     def plot_waveform(self):
-        # Plot the audio waveform
+        # Plot the audio waveform with downsampled data
         if self.y is not None:
             self.ax.clear()
-            times = np.arange(len(self.y)) / self.sr
-            self.ax.plot(times, self.y, label='Audio Waveform')
+            
+            # Plot every 100th sample for efficiency
+            downsample_factor = 100
+            times = np.arange(len(self.y))[::downsample_factor] / self.sr
+            y_downsampled = self.y[::downsample_factor]
+            
+            self.ax.plot(times, y_downsampled, label='Audio Waveform (Downsampled)')
             self.ax.set_xlabel('Time (s)')
             self.ax.set_ylabel('Amplitude')
             self.ax.set_title('Audio Amplitude Over Time')
             self.ax.legend()
             self.canvas.draw()
 
-    def detect_pop_sound(self):
-        if self.y is not None:
-            # Get the amplitude threshold value from the scale
-            threshold = self.threshold_scale.get()
+    def detect_pop_in_chunk(self, chunk, start_idx):
+        # Detect pops in a single chunk of audio
+        times = np.arange(start_idx, start_idx + len(chunk)) / self.sr
+        threshold = self.threshold_scale.get()
+        pop_indices = np.where(np.abs(chunk) > threshold)[0]
+        return times[pop_indices]
 
-            # Detect and highlight pop sounds based on amplitude
-            self.highlight_pop_sounds(threshold)
+    def detect_pop_sound_parallel(self):
+        chunk_duration = 600  # 10-minute chunks
+        chunk_size = int(self.sr * chunk_duration)
+        total_chunks = len(self.y) // chunk_size
 
-    def highlight_pop_sounds(self, threshold):
-        # Perform pop sound detection based on amplitude threshold
-        times = np.arange(len(self.y)) / self.sr
-        pop_indices = np.where(np.abs(self.y) > threshold)[0]
-        pop_times = times[pop_indices]
+        pop_times = []
 
-        # Group pop times by 0.5-second intervals
-        pop_half_seconds = set()
-        for t in pop_times:
-            half_second = int(t // 0.5) * 0.5  # Convert to 0.5-second intervals
-            pop_half_seconds.add(half_second)
+        # Use ThreadPoolExecutor for parallel processing
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = []
+            for i in range(total_chunks + 1):
+                start_idx = i * chunk_size
+                end_idx = min((i + 1) * chunk_size, len(self.y))
+                chunk = self.y[start_idx:end_idx]
+                futures.append(executor.submit(self.detect_pop_in_chunk, chunk, start_idx))
 
-        # Update pop count label
+            for future in concurrent.futures.as_completed(futures):
+                pop_times.extend(future.result())
+
+        # Group pop times by 0.5-second intervals and update the UI
+        pop_half_seconds = set(int(t // 0.5) * 0.5 for t in pop_times)
         self.pop_count_label.config(text=f"Detected Pops: {len(pop_half_seconds)}")
 
-        # Clear the plot and re-plot the waveform
-        self.ax.clear()
-        self.ax.plot(times, self.y, label='Audio Waveform')
+        # Optionally, mark the pop sounds on the plot (can be done here if needed)
+        self.highlight_pop_sounds(pop_half_seconds)
 
-        # Mark the detected pop sounds (grouped by 0.5-second intervals)
-        if len(pop_half_seconds) > 0:
-            print(f"Detected pop sound(s) above {threshold} amplitude at the following times (in 0.5-second intervals):")
-            for half_sec in sorted(pop_half_seconds):
-                print(f"{half_sec:.1f} seconds")
-                self.ax.axvline(x=half_sec, color='r', linestyle='--', label=f'Pop at {half_sec:.1f}s')
-        else:
-            print(f"No pop sounds detected above {threshold} amplitude.")
+    def highlight_pop_sounds(self, pop_times):
+        # Clear the plot and re-plot with highlights
+        if self.y is not None:
+            self.ax.clear()
 
-        # Update the plot
-        self.ax.set_xlabel('Time (s)')
-        self.ax.set_ylabel('Amplitude')
-        self.ax.set_title('Audio Amplitude Over Time')
-        self.ax.legend()
-        self.canvas.draw()
+            # Plot every 100th sample for efficiency
+            downsample_factor = 100
+            times = np.arange(len(self.y))[::downsample_factor] / self.sr
+            y_downsampled = self.y[::downsample_factor]
+
+            self.ax.plot(times, y_downsampled, label='Audio Waveform (Downsampled)')
+            
+            # Mark pop sound times with red dots
+            for pop_time in pop_times:
+                self.ax.axvline(x=pop_time, color='r', linestyle='--', label='Pop Detected')
+
+            self.ax.set_xlabel('Time (s)')
+            self.ax.set_ylabel('Amplitude')
+            self.ax.set_title('Audio Amplitude Over Time with Pop Sounds Highlighted')
+            self.ax.legend()
+            self.canvas.draw()
 
     def toggle_playback(self):
-        if self.is_playing:
-            self.stop_playback()
-        else:
-            self.start_playback()
+        # Toggle audio playback using pygame mixer
+        if self.audio_segment is None:
+            return
 
-    def start_playback(self):
-        if self.audio_segment:
-            self.is_playing = True
-            self.play_button.config(text="Stop Audio")
-            self.sound = pygame.mixer.Sound(self.audio_segment.raw_data)
-            self.sound.play(loops=0)
-
-    def stop_playback(self):
         if self.is_playing:
+            pygame.mixer.music.stop()
             self.is_playing = False
             self.play_button.config(text="Play Audio")
-            pygame.mixer.stop()  # Stop all audio playback
+        else:
+            if not pygame.mixer.music.get_busy():
+                audio_data = io.BytesIO(self.audio_segment.export(format="wav").read())
+                pygame.mixer.music.load(audio_data)
+                pygame.mixer.music.play()
+            self.is_playing = True
+            self.play_button.config(text="Stop Audio")
 
 # Create the main window
 root = tk.Tk()
+
+# Initialize the application
 app = AudioPopDetector(root)
+
+# Run the application
 root.mainloop()
